@@ -1,6 +1,9 @@
 // ========================== BACKEND (server.js) ==========================
-// Requirements: npm i express cors socket.io nodemailer dotenv
+// Requirements:
+// npm i express cors socket.io nodemailer dotenv
+
 require("dotenv").config();
+
 const express = require("express");
 const cors = require("cors");
 const http = require("http");
@@ -10,199 +13,236 @@ const path = require("path");
 
 const app = express();
 const server = http.createServer(app);
+
 const io = new Server(server, {
-  cors: { origin: "*", methods: ["GET", "POST"] },
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  }
 });
 
-// ---------- MIDDLEWARE ----------
+// ========================== MIDDLEWARE ==========================
 app.use(cors());
-app.use(express.json());   // FIXED: use JSON parser instead of text()
+app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Global state for active sending session
+// ========================== GLOBAL FLAGS ==========================
 let activeSending = false;
 let stopSending = false;
-let currentSendingProcess = null; // reference to promise resolver (optional)
 
-// Helper to reset flags
-function resetSendingFlags() {
-  stopSending = false;
-  activeSending = false;
-  currentSendingProcess = null;
-}
-
-// ---------- SOCKET.IO events ----------
+// ========================== SOCKET ==========================
 io.on("connection", (socket) => {
-  console.log(`🟢 Client connected: ${socket.id}`);
-  socket.emit("message", "Connected to RocketMail backend");
+  console.log("🟢 Connected:", socket.id);
+
+  socket.emit("email-status", {
+    message: "✅ Connected to RocketMail backend"
+  });
 
   socket.on("terminate-process", () => {
     if (activeSending) {
       stopSending = true;
-      console.log("🛑 Termination requested by client");
-      io.emit("terminated", "🛑 Email dispatch terminated by user");
+      io.emit("terminated", "🛑 Campaign terminated by user");
     } else {
-      socket.emit("email-status", { message: "ℹ️ No active email process to terminate" });
+      socket.emit("email-status", {
+        message: "ℹ️ No active process running"
+      });
     }
   });
 
   socket.on("disconnect", () => {
-    console.log(`🔴 Client disconnected: ${socket.id}`);
+    console.log("🔴 Disconnected:", socket.id);
   });
 });
 
-// ---------- EMAIL SENDER ENGINE ----------
+// ========================== SMTP FIXED ==========================
+function createTransporter(user, pass) {
+  return nodemailer.createTransport({
+    host: "smtp.gmail.com",
+    port: 587,
+    secure: false,
+    family: 4, // IMPORTANT: Force IPv4 (Render fix)
+    auth: {
+      user,
+      pass
+    },
+    tls: {
+      rejectUnauthorized: false
+    }
+  });
+}
+
+// ========================== EMAIL ENGINE ==========================
 async function sendEmails(emailList) {
-  // Reset stop flag at the start of actual sending
   stopSending = false;
 
-  const senderAccounts = [
-    { user: process.env.EMAIL_USER1, pass: process.env.EMAIL_PASS1 },
-    { user: process.env.EMAIL_USER2, pass: process.env.EMAIL_PASS2 },
-  ].filter(acc => acc.user && acc.pass);
+  const accounts = [
+    {
+      user: process.env.EMAIL_USER1,
+      pass: process.env.EMAIL_PASS1
+    },
+    {
+      user: process.env.EMAIL_USER2,
+      pass: process.env.EMAIL_PASS2
+    }
+  ].filter(x => x.user && x.pass);
 
-  if (senderAccounts.length === 0) {
-    io.emit("email-error", "No sender email credentials in .env file");
+  if (accounts.length === 0) {
+    io.emit("email-error", "❌ No sender credentials found");
     activeSending = false;
     return;
   }
 
-  const transporters = senderAccounts.map(acc =>
-    nodemailer.createTransport({
-      service: "gmail",
-      host: "smtp.gmail.com",
-  port: 587,
-  secure: false,
-      auth: { user: acc.user, pass: acc.pass },
-    })
+  const transporters = accounts.map(acc =>
+    createTransporter(acc.user, acc.pass)
   );
 
-  let sentCount = 0;
+  let sent = 0;
   const total = emailList.length;
+
   io.emit("progress", { current: 0, total });
 
   for (let i = 0; i < total; i++) {
     if (stopSending) {
-      console.log("🛑 Sending stopped by terminate signal");
-      io.emit("terminated", "🛑 Campaign was terminated before completion");
       activeSending = false;
+      io.emit("terminated", "🛑 Sending stopped");
       return;
     }
 
-    const receiverEmail = emailList[i];
-    // rotate sender every 50 emails, fallback to round-robin
-    const senderIndex = Math.floor(sentCount / 50) % senderAccounts.length;
+    const email = emailList[i];
+
+    const senderIndex = sent % transporters.length;
     const transporter = transporters[senderIndex];
-    const senderEmail = senderAccounts[senderIndex].user;
+    const senderEmail = accounts[senderIndex].user;
 
     try {
       await transporter.sendMail({
         from: `"Rachit Kumar" <${senderEmail}>`,
-        to: receiverEmail,
+        to: email,
         subject: "Backend Developer Internship Opportunity",
-        text: "Hello,\n\nPlease find my resume attached for the Backend Developer Internship role.\nLooking forward to your positive response.\n\nRegards,\nRachit Kumar",
+        text:
+          "Hello,\n\nPlease find my resume attached for Backend Developer Internship role.\n\nRegards,\nRachit Kumar",
         attachments: [
           {
             filename: "Resume_Rachit.pdf",
-            path: path.join(__dirname, "Resume.pdf"),
-          },
-        ],
+            path: path.join(__dirname, "Resume.pdf")
+          }
+        ]
       });
-      io.emit("email-status", { message: `✅ Delivered to ${receiverEmail}` });
+
+      io.emit("email-status", {
+        message: `✅ Delivered to ${email}`
+      });
+
     } catch (error) {
-      io.emit("email-status", { message: `❌ Failed: ${receiverEmail} - ${error.message}` });
+      io.emit("email-status", {
+        message: `❌ Failed: ${email} - ${error.message}`
+      });
     }
 
-    sentCount++;
-    io.emit("progress", { current: sentCount, total });
+    sent++;
 
-    // Delay 5 seconds between emails to respect rate limits
-    await new Promise(resolve => setTimeout(resolve, 5000));
+    io.emit("progress", {
+      current: sent,
+      total
+    });
+
+    await new Promise(r => setTimeout(r, 5000));
   }
 
-  io.emit("completed", { message: `🎉 Successfully processed ${sentCount} emails! Campaign finished.` });
   activeSending = false;
-  stopSending = false;
+
+  io.emit("completed", {
+    message: `🎉 Completed ${sent}/${total} emails`
+  });
 }
 
-// ---------- EXTRACT & FILTER EMAILS ----------
-function extractValidEmails(rawText) {
-  const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
-  const matches = rawText.match(emailRegex) || [];
-  const filtered = matches
-    .map(e => e.toLowerCase())
-    .filter(email => email.endsWith(".com"));
-  return [...new Set(filtered)];
+// ========================== EMAIL FILTER ==========================
+function extractEmails(text) {
+  const regex =
+    /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
+
+  const found = text.match(regex) || [];
+
+  return [...new Set(found.map(x => x.toLowerCase()))].filter(e =>
+    e.endsWith(".com")
+  );
 }
 
-// ---------- API ROUTE (EMAIL FILTER) ----------
+// ========================== API ==========================
 app.post("/api/v1/22343/email-filter", async (req, res) => {
   try {
     const { userId, password, emails } = req.body;
 
-    // Validate authentication from .env
-    const validUserId = process.env.USERID;
-    const validPassword = process.env.PASSWORD;
-
-    if (!validUserId || !validPassword) {
-      return res.status(500).json({ success: false, message: "Server missing auth credentials" });
-    }
-
-    if (userId !== validUserId || password !== validPassword) {
-      return res.status(401).json({ success: false, message: "Authentication failed: Invalid User ID or Password" });
-    }
-
-    if (!emails || typeof emails !== "string") {
-      return res.status(400).json({ success: false, message: "Emails field is required and must be text" });
-    }
-
-    const uniqueEmails = extractValidEmails(emails);
-    if (uniqueEmails.length === 0) {
-      return res.status(200).json({
-        success: true,
-        total: 0,
-        message: "No valid .com email addresses found",
-        emails: [],
+    if (
+      userId !== process.env.USERID ||
+      password !== process.env.PASSWORD
+    ) {
+      return res.status(401).json({
+        success: false,
+        message: "Invalid login"
       });
     }
 
-    // Check if another sending process is already active
+    if (!emails) {
+      return res.status(400).json({
+        success: false,
+        message: "Emails required"
+      });
+    }
+
+    const emailList = extractEmails(emails);
+
+    if (emailList.length === 0) {
+      return res.json({
+        success: true,
+        total: 0,
+        emails: [],
+        message: "No valid emails found"
+      });
+    }
+
     if (activeSending) {
       return res.status(409).json({
         success: false,
-        message: "Another email campaign is already running. Please wait or terminate it.",
+        message: "Campaign already running"
       });
     }
 
-    // Start sending process asynchronously (non-blocking)
     activeSending = true;
-    // Fire & forget sending emails
-    sendEmails(uniqueEmails).catch((err) => {
-      console.error("Email sender crashed", err);
-      io.emit("email-error", "Internal error while sending emails");
+
+    sendEmails(emailList).catch(err => {
+      console.log(err);
       activeSending = false;
+      io.emit("email-error", "Internal sender error");
     });
 
     return res.json({
       success: true,
-      total: uniqueEmails.length,
-      emails: uniqueEmails,
-      message: `Campaign started for ${uniqueEmails.length} recipients`,
+      total: emailList.length,
+      emails: emailList,
+      message: `Campaign started for ${emailList.length} recipients`
     });
+
   } catch (err) {
-    console.error("API Error:", err);
-    if (activeSending) activeSending = false;
-    res.status(500).json({ success: false, message: "Internal server error" });
+    return res.status(500).json({
+      success: false,
+      message: "Server error"
+    });
   }
 });
 
-// Optional: health check
-app.get("/health", (req, res) => res.json({ status: "ok" }));
+// ========================== HEALTH ==========================
+app.get("/", (req, res) => {
+  res.send("RocketMail Backend Live 🚀");
+});
 
-// ---------- START SERVER ----------
+app.get("/health", (req, res) => {
+  res.json({ status: "ok" });
+});
+
+// ========================== START ==========================
 const PORT = process.env.PORT || 3000;
+
 server.listen(PORT, () => {
-  console.log(`🚀 RocketMail backend live on port ${PORT}`);
-  console.log(`   - Socket.IO ready`);
-  console.log(`   - Make sure .env has USERID, PASSWORD, EMAIL_USER1, EMAIL_PASS1, EMAIL_USER2, EMAIL_PASS2`);
+  console.log("🚀 Running on port", PORT);
 });
