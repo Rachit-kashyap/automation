@@ -70,6 +70,9 @@ async function sendEmails(emailList) {
   const transporters = senderAccounts.map(acc =>
     nodemailer.createTransport({
       service: "gmail",
+      host: "smtp.gmail.com",
+  port: 587,
+  secure: false,
       auth: { user: acc.user, pass: acc.pass },
     })
   );
