@@ -6,68 +6,70 @@ const http = require("http");
 const { Server } = require("socket.io");
 const nodemailer = require("nodemailer");
 const path = require("path");
+const dns = require("dns");
+const { promisify } = require("util");
 
 const app = express();
 const server = http.createServer(app);
 
-// ---------- Socket.IO with correct path and CORS ----------
+// ---------- Socket.IO ----------
 const io = new Server(server, {
-  cors: {
-    origin: "*", // Restrict to your frontend domain in production
-    methods: ["GET", "POST"]
-  },
+  cors: { origin: "*", methods: ["GET", "POST"] },
   path: "/socket.io",
   pingTimeout: 60000,
   pingInterval: 25000
 });
 
-// ---------- Middleware ----------
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// (Optional) Serve frontend static files if you place build output here
-// app.use(express.static(path.join(__dirname, "dist")));
-
-// ---------- Global flags ----------
 let activeSending = false;
 let stopSending = false;
 
-// ---------- Socket events ----------
-io.on("connection", (socket) => {
-  console.log("✅ Client connected:", socket.id);
-  socket.emit("email-status", { message: "✅ Connected to RocketMail backend" });
+// ---------- FORCE IPv4 for Gmail SMTP ----------
+// Option 1: Use `family: 4` in transporter
+// Option 2 (fallback): Resolve smtp.gmail.com to IPv4 manually
+const getIPv4Address = async () => {
+  const { address } = await promisify(dns.lookup)("smtp.gmail.com", { family: 4 });
+  return address;
+};
 
-  socket.on("terminate-process", () => {
-    if (activeSending) {
-      stopSending = true;
-      io.emit("terminated", "🛑 Campaign terminated by user");
-    } else {
-      socket.emit("email-status", { message: "ℹ️ No active process running" });
-    }
-  });
-
-  socket.on("disconnect", () => {
-    console.log("❌ Client disconnected:", socket.id);
-  });
-});
-
-// ---------- SMTP Transporter (IPv4 FIX) ----------
-const createTransporter = (user, pass) =>
-  nodemailer.createTransport({
+// Create transporter with hardcoded IPv4 host if needed
+const createTransporter = async (user, pass) => {
+  // Try standard method with family:4 first
+  let transporter = nodemailer.createTransport({
     host: "smtp.gmail.com",
     port: 587,
-    secure: false,           // TLS
-    family: 4,               // FORCE IPv4 – critical for Render
+    secure: false,
+    family: 4,
     auth: { user, pass },
     tls: { rejectUnauthorized: false }
   });
 
-// ---------- Email sending engine ----------
+  // Verify connection; if it fails with IPv6 error, fallback to direct IPv4
+  try {
+    await transporter.verify();
+  } catch (err) {
+    if (err.message.includes("ENETUNREACH") || err.message.includes("IPv6")) {
+      console.log("⚠️ IPv6 issue detected, falling back to direct IPv4 address...");
+      const ipv4 = await getIPv4Address();
+      transporter = nodemailer.createTransport({
+        host: ipv4,
+        port: 587,
+        secure: false,
+        auth: { user, pass },
+        tls: { rejectUnauthorized: false }
+      });
+    }
+  }
+  return transporter;
+};
+
+// ---------- Email sending engine (using async transporters) ----------
 async function sendEmails(emailList) {
   stopSending = false;
 
-  // Load sender accounts from environment variables
   const accounts = [
     { user: process.env.EMAIL_USER1, pass: process.env.EMAIL_PASS1 },
     { user: process.env.EMAIL_USER2, pass: process.env.EMAIL_PASS2 }
@@ -79,10 +81,15 @@ async function sendEmails(emailList) {
     return;
   }
 
-  const transporters = accounts.map(acc => createTransporter(acc.user, acc.pass));
+  // Build transporters asynchronously
+  const transporters = [];
+  for (const acc of accounts) {
+    const transporter = await createTransporter(acc.user, acc.pass);
+    transporters.push(transporter);
+  }
+
   let sent = 0;
   const total = emailList.length;
-
   io.emit("progress", { current: 0, total });
 
   for (let i = 0; i < total; i++) {
@@ -117,14 +124,14 @@ async function sendEmails(emailList) {
 
     sent++;
     io.emit("progress", { current: sent, total });
-    await new Promise(resolve => setTimeout(resolve, 5000)); // 5s delay
+    await new Promise(resolve => setTimeout(resolve, 5000));
   }
 
   activeSending = false;
   io.emit("completed", { message: `🎉 Completed ${sent}/${total} emails` });
 }
 
-// ---------- Email extraction (.com only) ----------
+// ---------- Email extraction ----------
 function extractEmails(text) {
   const regex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
   const found = text.match(regex) || [];
@@ -136,7 +143,6 @@ app.post("/api/v1/22343/email-filter", async (req, res) => {
   try {
     const { userId, password, emails } = req.body;
 
-    // Authentication against environment variables
     if (userId !== process.env.USERID || password !== process.env.PASSWORD) {
       return res.status(401).json({ success: false, message: "Invalid login" });
     }
@@ -156,9 +162,8 @@ app.post("/api/v1/22343/email-filter", async (req, res) => {
     }
 
     activeSending = true;
-    // Start sending in background; response is sent immediately
     sendEmails(emailList).catch(err => {
-      console.error("Email sender error:", err);
+      console.error(err);
       activeSending = false;
       io.emit("email-error", "Internal sender error");
     });
@@ -170,16 +175,14 @@ app.post("/api/v1/22343/email-filter", async (req, res) => {
       message: `Campaign started for ${emailList.length} recipients`
     });
   } catch (err) {
-    console.error("API error:", err);
+    console.error(err);
     return res.status(500).json({ success: false, message: "Server error" });
   }
 });
 
-// ---------- Health checks ----------
 app.get("/health", (req, res) => res.json({ status: "ok" }));
 app.get("/", (req, res) => res.send("RocketMail Backend Live 🚀"));
 
-// ---------- Start server ----------
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server running on port ${PORT}`);
